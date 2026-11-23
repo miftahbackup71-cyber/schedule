@@ -108,7 +108,7 @@
 				class="flex items-center justify-between gap-2 rounded-t-[22px] border-b-2 border-ink bg-butter px-4 py-2.5"
 			>
 				<span class="pl-5 font-display text-xs font-bold text-ink">
-					Kan sudah dibilang jangan diklik
+					Apaan coba ini ga tau ah
 				</span>
 				<button
 					type="button"
