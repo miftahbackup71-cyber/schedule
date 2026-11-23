@@ -12,11 +12,8 @@
 	import ScheduleSkeleton from '#lib/components/ScheduleSkeleton.svelte';
 	import TimelineToolbar from '#lib/components/TimelineToolbar.svelte';
 	import ToastHost from '#lib/components/ToastHost.svelte';
-	import UnsavedGuardDialog from '#lib/components/UnsavedGuardDialog.svelte';
 	import { ScheduleStore } from '#lib/stores/schedule.svelte.ts';
 	import type { ScheduleFormInput, ScheduleItem } from '#lib/types/schedule.ts';
-
-	type PendingNavigation = { type: 'open'; date: string } | { type: 'new' };
 
 	const store = new ScheduleStore();
 
@@ -25,13 +22,33 @@
 	let editingItem = $state<ScheduleItem | null>(null);
 	let isClearConfirmOpen = $state(false);
 	let isEasterEggOpen = $state(false);
-	let pendingNav = $state<PendingNavigation | null>(null);
 
 	let hasFloatingMobileCta = $derived(!store.isLoading && store.totalCount > 0);
 	let requireDateInModal = $derived(!editingItem && store.totalCount === 0);
 
 	onMount(() => {
 		void store.init();
+
+		const handleVisibilityChange = () => {
+			if (document.visibilityState === 'hidden' && store.hasPendingSync()) {
+				void store.flushPendingSync();
+			}
+		};
+
+		const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+			if (store.hasPendingSync()) {
+				void store.flushPendingSync();
+				event.preventDefault();
+			}
+		};
+
+		document.addEventListener('visibilitychange', handleVisibilityChange);
+		window.addEventListener('beforeunload', handleBeforeUnload);
+
+		return () => {
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
+			window.removeEventListener('beforeunload', handleBeforeUnload);
+		};
 	});
 
 	function openAddModal() {
@@ -54,39 +71,13 @@
 		isDrawerOpen = true;
 	}
 
-	async function executeNavigation(nav: PendingNavigation) {
-		if (nav.type === 'open') {
-			await store.openSavedSchedule(nav.date);
-		} else {
-			store.startNewSchedule();
-		}
+	function handleSelectSchedule(date: string) {
+		if (date === store.selectedDate) return;
+		void store.openSavedSchedule(date);
 	}
 
-	function requestNavigation(nav: PendingNavigation) {
-		if (nav.type === 'open' && nav.date === store.selectedDate && !store.hasUnsavedChanges) {
-			return;
-		}
-		if (store.hasUnsavedChanges && store.totalCount > 0) {
-			pendingNav = nav;
-			return;
-		}
-		void executeNavigation(nav);
-	}
-
-	async function handleSaveAndContinue() {
-		const target = pendingNav;
-		if (!target) return;
-		await store.saveSchedule();
-		pendingNav = null;
-		await executeNavigation(target);
-	}
-
-	async function handleDiscardAndContinue() {
-		const target = pendingNav;
-		if (!target) return;
-		store.discardChanges();
-		pendingNav = null;
-		await executeNavigation(target);
+	function handleCreateNewSchedule() {
+		void store.startNewSchedule();
 	}
 
 	async function handleModalSubmit(
@@ -132,7 +123,7 @@
 			<span class="min-w-0 flex-1">{store.connectionNotice}</span>
 			<button
 				type="button"
-				onclick={() => store.init()}
+				onclick={() => (store.selectedDate ? store.retrySync() : store.init())}
 				class="h-7 shrink-0 cursor-pointer rounded-lg border-[1.5px] border-ink bg-white px-2.5 font-display text-[11px] font-bold text-ink hover:bg-cream"
 			>
 				Coba Lagi
@@ -151,10 +142,8 @@
 				totalCount={store.totalCount}
 				completedCount={store.completedCount}
 				progressPercent={store.progressPercent}
-				hasUnsavedChanges={store.hasUnsavedChanges}
-				isSaving={store.isSaving}
-				lastSavedLabel={store.lastSavedLabel}
-				onSaveSchedule={() => store.saveSchedule()}
+				syncStatus={store.syncStatus}
+				onRetrySync={() => store.retrySync()}
 				onRequestClearAll={() => (isClearConfirmOpen = true)}
 			/>
 
@@ -237,16 +226,8 @@
 	savedSchedules={store.savedSchedules}
 	activeDate={store.selectedDate}
 	onClose={() => (isDrawerOpen = false)}
-	onSelectSchedule={(date) => requestNavigation({ type: 'open', date })}
-	onCreateNew={() => requestNavigation({ type: 'new' })}
-/>
-
-<UnsavedGuardDialog
-	open={pendingNav !== null}
-	isSaving={store.isSaving}
-	onSaveAndContinue={handleSaveAndContinue}
-	onDiscardAndContinue={handleDiscardAndContinue}
-	onCancel={() => (pendingNav = null)}
+	onSelectSchedule={handleSelectSchedule}
+	onCreateNew={handleCreateNewSchedule}
 />
 
 <ScheduleModal

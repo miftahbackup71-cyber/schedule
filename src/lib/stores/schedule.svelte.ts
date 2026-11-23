@@ -1,9 +1,14 @@
 import { browser } from '$app/env';
-import { getSupabaseClient, resolveSupabaseSession } from '#lib/supabase/client.ts';
+import {
+	getSupabaseClient,
+	resetSupabaseSession,
+	resolveSupabaseSession
+} from '#lib/supabase/client.ts';
 import type {
 	SavedScheduleSummary,
 	ScheduleFormInput,
 	ScheduleItem,
+	SyncStatus,
 	ToastAction,
 	ToastItem,
 	ToastVariant
@@ -26,6 +31,12 @@ interface ScheduleRow {
 interface PendingDelete {
 	item: ScheduleItem;
 	index: number;
+}
+
+interface SyncSnapshot {
+	date: string;
+	items: ScheduleItem[];
+	revision: number;
 }
 
 function generateUuid(): string {
@@ -72,9 +83,7 @@ export class ScheduleStore {
 	items = $state<ScheduleItem[]>([]);
 	savedSchedules = $state<SavedScheduleSummary[]>([]);
 	isLoading = $state(true);
-	isSaving = $state(false);
-	hasUnsavedChanges = $state(false);
-	lastSavedLabel = $state<string | null>(null);
+	syncStatus = $state<SyncStatus>('idle');
 	connectionNotice = $state<string | null>(null);
 	toasts = $state<ToastItem[]>([]);
 	lastAddedId = $state<string | null>(null);
@@ -84,6 +93,12 @@ export class ScheduleStore {
 	private pendingDeletes = new Map<string, PendingDelete>();
 	private toastTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+	private syncTimer: ReturnType<typeof setTimeout> | null = null;
+	private activeSyncPromise: Promise<boolean> | null = null;
+	private syncRevision = 0;
+	private pendingSnapshot: SyncSnapshot | null = null;
+
+	isSaving = $derived(this.syncStatus === 'saving');
 	totalCount = $derived(this.items.length);
 	completedCount = $derived(this.items.filter((item) => item.is_completed).length);
 	progressPercent = $derived(
@@ -94,6 +109,14 @@ export class ScheduleStore {
 		this.selectedDate ? formatIndonesianDate(this.selectedDate) : ''
 	);
 	savedDatesSet = $derived(new Set(this.savedSchedules.map((s) => s.date)));
+
+	hasPendingSync(): boolean {
+		return (
+			this.syncTimer !== null ||
+			this.activeSyncPromise !== null ||
+			this.pendingSnapshot !== null
+		);
+	}
 
 	async init(): Promise<void> {
 		if (!browser) return;
@@ -110,8 +133,7 @@ export class ScheduleStore {
 			} else {
 				this.selectedDate = null;
 				this.items = [];
-				this.hasUnsavedChanges = false;
-				this.lastSavedLabel = null;
+				this.syncStatus = 'idle';
 			}
 		} finally {
 			this.isLoading = false;
@@ -173,6 +195,8 @@ export class ScheduleStore {
 
 	async openSavedSchedule(isoDate: string, showFeedback = true): Promise<void> {
 		if (!browser) return;
+		await this.flushPendingSync();
+
 		this.isLoading = true;
 		this.pendingDeletes.clear();
 		this.selectedDate = isoDate;
@@ -212,21 +236,27 @@ export class ScheduleStore {
 			if (remoteItems.length > 0) {
 				this.items = remoteItems;
 				this.writeSavedLocalForDate(isoDate, remoteItems);
+				this.updateSavedSummaryForDate(isoDate, remoteItems);
+				this.syncStatus = 'saved';
+				this.connectionNotice = null;
 			} else {
-				this.items = this.readSavedLocalForDate(isoDate);
+				const localItems = this.readSavedLocalForDate(isoDate);
+				this.items = localItems;
+				if (localItems.length > 0) {
+					// Data sebelumnya baru tersimpan di perangkat — langsung unggah ke Supabase
+					this.persistAndSync(0);
+				} else {
+					this.syncStatus = 'idle';
+				}
 			}
 
-			this.hasUnsavedChanges = false;
-			this.lastSavedLabel = 'Udah disimpen';
-			this.connectionNotice = null;
 			if (showFeedback) {
 				this.showToast(`Jadwal ${formatIndonesianDate(isoDate)} udah kebuka.`, 'navy');
 			}
 		} catch (err) {
 			console.warn('Gagal membuka dari server, membuka dari penyimpanan perangkat:', err);
 			this.items = this.readSavedLocalForDate(isoDate);
-			this.hasUnsavedChanges = false;
-			this.lastSavedLabel = 'Disimpen di HP ini';
+			this.syncStatus = this.items.length > 0 ? 'error' : 'idle';
 			if (showFeedback) {
 				this.showToast(`Jadwal ${formatIndonesianDate(isoDate)} udah kebuka.`, 'navy');
 			}
@@ -235,126 +265,45 @@ export class ScheduleStore {
 		}
 	}
 
-	startNewSchedule(): void {
+	async startNewSchedule(): Promise<void> {
+		await this.flushPendingSync();
 		this.pendingDeletes.clear();
 		this.selectedDate = null;
 		this.items = [];
-		this.hasUnsavedChanges = false;
-		this.lastSavedLabel = null;
+		this.syncStatus = 'idle';
 	}
 
-	discardChanges(): void {
-		this.pendingDeletes.clear();
-		this.hasUnsavedChanges = false;
-		this.items = [];
-		this.selectedDate = null;
-		this.lastSavedLabel = null;
-	}
+	async flushPendingSync(): Promise<boolean> {
+		if (!browser) return true;
 
-	async saveSchedule(): Promise<boolean> {
-		if (!browser || this.isSaving || !this.selectedDate) return false;
-		this.isSaving = true;
-
-		const date = this.selectedDate;
-		const normalizedItems = this.items.map((item, idx) => ({
-			...item,
-			position: idx,
-			schedule_date: date
-		}));
-		this.items = normalizedItems;
-		this.writeSavedLocalForDate(date, normalizedItems);
-
-		try {
-			const session = await resolveSupabaseSession();
-			this.userId = session.userId;
-			this.authDisabled = session.authDisabled;
-
-			const supabase = getSupabaseClient();
-
-			if (normalizedItems.length > 0) {
-				const rows = normalizedItems.map((item) => {
-					const base = {
-						id: item.id,
-						title: item.title,
-						start_time: item.start_time,
-						description: item.description,
-						helper_text: item.helper_text,
-						position: item.position,
-						is_completed: item.is_completed,
-						schedule_date: date
-					};
-					return this.userId ? { ...base, user_id: this.userId } : base;
-				});
-
-				const { error: upsertError } = await supabase
-					.from('schedules')
-					.upsert(rows, { onConflict: 'id' });
-
-				if (upsertError) throw upsertError;
-
-				let existingQuery = supabase
-					.from('schedules')
-					.select('id')
-					.eq('schedule_date', date);
-				if (this.userId) {
-					existingQuery = existingQuery.eq('user_id', this.userId);
-				}
-
-				const { data: existingRows } = await existingQuery;
-				const currentIds = new Set(normalizedItems.map((i) => i.id));
-				const staleIds = ((existingRows ?? []) as { id: string }[])
-					.map((r) => r.id)
-					.filter((id) => !currentIds.has(id));
-
-				if (staleIds.length > 0) {
-					let delQuery = supabase.from('schedules').delete().in('id', staleIds);
-					if (this.userId) {
-						delQuery = delQuery.eq('user_id', this.userId);
-					}
-					const { error: delError } = await delQuery;
-					if (delError) throw delError;
-				}
-			} else {
-				let clearQuery = supabase.from('schedules').delete().eq('schedule_date', date);
-				if (this.userId) {
-					clearQuery = clearQuery.eq('user_id', this.userId);
-				}
-				const { error: clearError } = await clearQuery;
-				if (clearError) throw clearError;
-			}
-
-			this.connectionNotice = null;
-			this.hasUnsavedChanges = false;
-			this.lastSavedLabel = 'Udah disimpen';
-			await this.refreshSavedList();
-			this.showToast('Jadwal udah disimpen!', 'mint');
-			return true;
-		} catch (err) {
-			const pgCode = (err as { code?: string } | null)?.code;
-			const msg = (err as { message?: string } | null)?.message ?? '';
-
-			if (pgCode === '42501' || msg.toLowerCase().includes('row-level security')) {
-				this.connectionNotice = this.authDisabled
-					? 'Aktifkan "Allow anonymous sign-ins" di Dashboard Supabase (Authentication -> Providers) agar jadwal bisa disimpen ke server.'
-					: 'Izin simpen ditolak oleh aturan RLS Supabase. Cek policy tabel schedules.';
-				this.showToast(
-					'Jadwal disimpen di perangkat dulu. Cek pengaturan Supabase buat simpen ke server ya.',
-					'butter',
-					undefined,
-					4200
-				);
-			} else {
-				this.connectionNotice = 'Belum terhubung ke server. Jadwal disimpen di perangkat ini dulu ya.';
-				this.showToast('Jadwal disimpen di perangkat ini ya.', 'butter');
-			}
-
-			this.hasUnsavedChanges = false;
-			this.lastSavedLabel = 'Disimpen di HP ini';
-			this.refreshSavedListLocalOnly();
-			return true;
-		} finally {
-			this.isSaving = false;
+		if (this.syncTimer) {
+			clearTimeout(this.syncTimer);
+			this.syncTimer = null;
 		}
+
+		if (this.activeSyncPromise) {
+			const ok = await this.activeSyncPromise;
+			if (this.pendingSnapshot) {
+				return this.runSyncQueue();
+			}
+			return ok;
+		}
+
+		if (this.pendingSnapshot) {
+			return this.runSyncQueue();
+		}
+
+		return true;
+	}
+
+	async retrySync(): Promise<boolean> {
+		if (!browser || !this.selectedDate) return false;
+		this.persistAndSync(0);
+		const ok = await this.flushPendingSync();
+		if (ok) {
+			this.showToast('Jadwal udah kesimpen ke server!', 'mint');
+		}
+		return ok;
 	}
 
 	suggestNextStartTime(): string {
@@ -376,12 +325,12 @@ export class ScheduleStore {
 		// Aktivitas pertama pada jadwal kosong wajib menentukan tanggal
 		if (this.items.length === 0) {
 			targetDate = input.schedule_date || getTodayIsoDate();
-			this.selectedDate = targetDate;
 
 			// Jika tanggal ini sudah pernah disimpan, muat aktivitas sebelumnya dulu agar tidak hilang
-			if (this.savedDatesSet.has(targetDate)) {
+			if (this.savedDatesSet.has(targetDate) && this.selectedDate !== targetDate) {
 				await this.openSavedSchedule(targetDate, false);
 			}
+			this.selectedDate = targetDate;
 		}
 
 		const resolvedDate = targetDate ?? getTodayIsoDate();
@@ -401,7 +350,7 @@ export class ScheduleStore {
 
 		this.items = [...this.items, newItem];
 		this.lastAddedId = newItem.id;
-		this.markDirty();
+		this.persistAndSync(0);
 		this.showToast('Aktivitas udah dibikin.', 'navy');
 		return true;
 	}
@@ -419,7 +368,7 @@ export class ScheduleStore {
 		};
 
 		this.items = this.items.map((item) => (item.id === id ? updated : item));
-		this.markDirty();
+		this.persistAndSync(0);
 		this.showToast('Aktivitas udah diedit.', 'butter');
 		return true;
 	}
@@ -432,7 +381,7 @@ export class ScheduleStore {
 		this.items = this.items.map((item) =>
 			item.id === id ? { ...item, is_completed: nextDone } : item
 		);
-		this.markDirty();
+		this.persistAndSync(300);
 
 		if (nextDone && this.items.length > 0 && this.items.every((i) => i.is_completed)) {
 			this.showToast('Mantap! Semua aktivitas udah beres!', 'mint');
@@ -448,7 +397,7 @@ export class ScheduleStore {
 		const nextList = [...this.items];
 		[nextList[idx], nextList[targetIdx]] = [nextList[targetIdx], nextList[idx]];
 		this.items = nextList.map((item, pos) => ({ ...item, position: pos }));
-		this.markDirty();
+		this.persistAndSync(300);
 	}
 
 	remove(id: string): void {
@@ -458,7 +407,7 @@ export class ScheduleStore {
 		const removed = this.items[idx];
 		this.items = this.items.filter((item) => item.id !== id);
 		this.pendingDeletes.set(id, { item: removed, index: idx });
-		this.markDirty();
+		this.persistAndSync(300);
 
 		this.showToast(
 			'Aktivitas dihapus.',
@@ -476,22 +425,39 @@ export class ScheduleStore {
 		if (!pending) return;
 
 		this.pendingDeletes.delete(id);
+		if (!this.selectedDate) {
+			this.selectedDate = pending.item.schedule_date;
+		}
 		const next = [...this.items];
 		const insertIndex = Math.min(pending.index, next.length);
 		next.splice(insertIndex, 0, pending.item);
 		this.items = next;
 		this.lastAddedId = pending.item.id;
-		this.markDirty();
+		this.persistAndSync(0);
 		this.showToast('Aktivitas dibalikin lagi.', 'mint');
 	}
 
 	async clearCurrentSchedule(): Promise<void> {
 		this.pendingDeletes.clear();
 		const date = this.selectedDate;
+
+		// Batalkan antrean sync untuk tanggal yang akan dihapus agar tidak menimpa delete
+		if (this.syncTimer) {
+			clearTimeout(this.syncTimer);
+			this.syncTimer = null;
+		}
+		if (this.pendingSnapshot?.date === date) {
+			this.pendingSnapshot = null;
+		}
+		if (this.activeSyncPromise) {
+			await this.activeSyncPromise;
+		}
+
 		this.items = [];
 
-		if (date && this.savedDatesSet.has(date)) {
+		if (date) {
 			this.writeSavedLocalForDate(date, []);
+			this.updateSavedSummaryForDate(date, []);
 			try {
 				const session = await resolveSupabaseSession();
 				this.userId = session.userId;
@@ -500,16 +466,15 @@ export class ScheduleStore {
 				if (this.userId) {
 					clearQuery = clearQuery.eq('user_id', this.userId);
 				}
-				await clearQuery;
-			} catch {
-				// Tetap lanjut hapus lokal
+				const { error } = await clearQuery;
+				if (error) throw error;
+			} catch (err) {
+				console.error('[KudilSchedule] Gagal menghapus jadwal di Supabase:', err);
 			}
-			await this.refreshSavedList();
 		}
 
 		this.selectedDate = null;
-		this.hasUnsavedChanges = false;
-		this.lastSavedLabel = null;
+		this.syncStatus = 'idle';
 		this.showToast('Jadwal udah dihapus.', 'coral');
 	}
 
@@ -538,24 +503,201 @@ export class ScheduleStore {
 		this.toasts = this.toasts.filter((t) => t.id !== id);
 	}
 
-	private markDirty(): void {
-		this.hasUnsavedChanges = true;
-		this.lastSavedLabel = null;
+	private persistAndSync(debounceMs: number): void {
+		if (!browser || !this.selectedDate) return;
+
+		const date = this.selectedDate;
+		const normalizedItems = this.items.map((item, idx) => ({
+			...item,
+			position: idx,
+			schedule_date: date
+		}));
+		this.items = normalizedItems;
+		this.writeSavedLocalForDate(date, normalizedItems);
+		this.updateSavedSummaryForDate(date, normalizedItems);
+
+		this.syncRevision += 1;
+		this.pendingSnapshot = {
+			date,
+			items: normalizedItems.map((item) => ({ ...item })),
+			revision: this.syncRevision
+		};
+		this.syncStatus = 'saving';
+
+		if (this.syncTimer) {
+			clearTimeout(this.syncTimer);
+			this.syncTimer = null;
+		}
+
+		if (debounceMs <= 0) {
+			void this.runSyncQueue();
+		} else {
+			this.syncTimer = setTimeout(() => {
+				this.syncTimer = null;
+				void this.runSyncQueue();
+			}, debounceMs);
+		}
 	}
 
-	private refreshSavedListLocalOnly(): void {
-		const localMap = this.readAllSavedLocal();
-		const list: SavedScheduleSummary[] = [];
-		for (const [date, items] of Object.entries(localMap)) {
-			if (items.length > 0) {
-				list.push({
-					date,
-					totalCount: items.length,
-					completedCount: items.filter((i) => i.is_completed).length
-				});
-			}
+	private runSyncQueue(): Promise<boolean> {
+		if (this.activeSyncPromise) {
+			return this.activeSyncPromise;
 		}
-		this.savedSchedules = list.sort((a, b) => b.date.localeCompare(a.date));
+
+		this.activeSyncPromise = (async () => {
+			let allSucceeded = true;
+
+			while (this.pendingSnapshot) {
+				const snapshot = this.pendingSnapshot;
+				this.pendingSnapshot = null;
+
+				if (this.selectedDate === snapshot.date) {
+					this.syncStatus = 'saving';
+				}
+
+				const ok = await this.syncSnapshotToSupabase(snapshot);
+				if (!ok) {
+					allSucceeded = false;
+					if (!this.pendingSnapshot && this.selectedDate === snapshot.date) {
+						this.syncStatus = 'error';
+					}
+					break;
+				}
+
+				if (
+					!this.pendingSnapshot &&
+					this.syncTimer === null &&
+					this.selectedDate === snapshot.date
+				) {
+					this.syncStatus = snapshot.items.length > 0 ? 'saved' : 'idle';
+					this.connectionNotice = null;
+				}
+			}
+
+			return allSucceeded;
+		})().finally(() => {
+			this.activeSyncPromise = null;
+		});
+
+		return this.activeSyncPromise;
+	}
+
+	private async syncSnapshotToSupabase(
+		snapshot: SyncSnapshot,
+		allowSessionReset = true
+	): Promise<boolean> {
+		try {
+			const session = await resolveSupabaseSession();
+			this.userId = session.userId;
+			this.authDisabled = session.authDisabled;
+
+			const supabase = getSupabaseClient();
+
+			if (snapshot.items.length > 0) {
+				const rows = snapshot.items.map((item) => {
+					const base = {
+						id: item.id,
+						title: item.title,
+						start_time: item.start_time,
+						description: item.description,
+						helper_text: item.helper_text,
+						position: item.position,
+						is_completed: item.is_completed,
+						schedule_date: snapshot.date
+					};
+					return this.userId ? { ...base, user_id: this.userId } : base;
+				});
+
+				const { error: upsertError } = await supabase
+					.from('schedules')
+					.upsert(rows, { onConflict: 'id' });
+
+				if (upsertError) throw upsertError;
+
+				let existingQuery = supabase
+					.from('schedules')
+					.select('id')
+					.eq('schedule_date', snapshot.date);
+				if (this.userId) {
+					existingQuery = existingQuery.eq('user_id', this.userId);
+				}
+
+				const { data: existingRows, error: selectError } = await existingQuery;
+				if (selectError) throw selectError;
+
+				const currentIds = new Set(snapshot.items.map((i) => i.id));
+				const staleIds = ((existingRows ?? []) as { id: string }[])
+					.map((r) => r.id)
+					.filter((id) => !currentIds.has(id));
+
+				if (staleIds.length > 0) {
+					let delQuery = supabase.from('schedules').delete().in('id', staleIds);
+					if (this.userId) {
+						delQuery = delQuery.eq('user_id', this.userId);
+					}
+					const { error: delError } = await delQuery;
+					if (delError) throw delError;
+				}
+			} else {
+				let clearQuery = supabase.from('schedules').delete().eq('schedule_date', snapshot.date);
+				if (this.userId) {
+					clearQuery = clearQuery.eq('user_id', this.userId);
+				}
+				const { error: clearError } = await clearQuery;
+				if (clearError) throw clearError;
+			}
+
+			return true;
+		} catch (err) {
+			const pgCode = (err as { code?: string } | null)?.code;
+			const status = (err as { status?: number } | null)?.status;
+			const msg = (err as { message?: string } | null)?.message ?? '';
+
+			// Recovery otomatis jika sesi anonim lokal sudah tidak valid / user dihapus di server
+			if (
+				allowSessionReset &&
+				(pgCode === '23503' || status === 401 || msg.toLowerCase().includes('jwt'))
+			) {
+				try {
+					const fresh = await resetSupabaseSession();
+					this.userId = fresh.userId;
+					this.authDisabled = fresh.authDisabled;
+					return this.syncSnapshotToSupabase(snapshot, false);
+				} catch (resetErr) {
+					console.error('[KudilSchedule] Gagal memperbarui sesi anonim Supabase:', resetErr);
+				}
+			}
+
+			console.error('[KudilSchedule] Gagal sinkron ke Supabase:', err);
+
+			const hadNoticeBefore = this.connectionNotice !== null;
+			if (pgCode === '42501' || msg.toLowerCase().includes('row-level security')) {
+				this.connectionNotice = this.authDisabled
+					? 'Aktifkan "Allow anonymous sign-ins" di Dashboard Supabase (Authentication -> Providers) agar jadwal bisa disimpen ke server.'
+					: 'Izin simpen ditolak oleh aturan RLS Supabase. Cek policy tabel schedules.';
+			} else {
+				this.connectionNotice =
+					'Belum bisa nyimpen ke server. Perubahan tetap aman di perangkat ini — klik Simpen Ulang nanti ya.';
+			}
+
+			if (!hadNoticeBefore) {
+				this.showToast('Gagal sinkron ke server, sementara disimpen di perangkat ya.', 'butter', undefined, 3600);
+			}
+
+			return false;
+		}
+	}
+
+	private updateSavedSummaryForDate(isoDate: string, list: ScheduleItem[]): void {
+		const filtered = this.savedSchedules.filter((entry) => entry.date !== isoDate);
+		if (list.length > 0) {
+			filtered.push({
+				date: isoDate,
+				totalCount: list.length,
+				completedCount: list.filter((i) => i.is_completed).length
+			});
+		}
+		this.savedSchedules = filtered.sort((a, b) => b.date.localeCompare(a.date));
 	}
 
 	private readAllSavedLocal(): Record<string, ScheduleItem[]> {

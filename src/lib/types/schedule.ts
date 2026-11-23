@@ -23,6 +23,8 @@ export interface SavedScheduleSummary {
 	completedCount: number;
 }
 
+export type SyncStatus = 'idle' | 'saving' | 'saved' | 'error';
+
 export type ToastVariant = 'navy' | 'mint' | 'butter' | 'coral';
 
 export interface ToastAction {

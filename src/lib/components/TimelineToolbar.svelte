@@ -1,13 +1,13 @@
 <script lang="ts">
+	import type { SyncStatus } from '#lib/types/schedule.ts';
+
 	interface Props {
 		formattedDate: string;
 		totalCount: number;
 		completedCount: number;
 		progressPercent: number;
-		hasUnsavedChanges: boolean;
-		isSaving: boolean;
-		lastSavedLabel: string | null;
-		onSaveSchedule: () => void;
+		syncStatus: SyncStatus;
+		onRetrySync: () => void;
 		onRequestClearAll: () => void;
 	}
 
@@ -16,16 +16,14 @@
 		totalCount,
 		completedCount,
 		progressPercent,
-		hasUnsavedChanges,
-		isSaving,
-		lastSavedLabel,
-		onSaveSchedule,
+		syncStatus,
+		onRetrySync,
 		onRequestClearAll
 	}: Props = $props();
 </script>
 
 <section class="neo-border neo-shadow rounded-xl bg-white p-3 sm:rounded-2xl sm:p-4">
-	<!-- Baris Atas: Tanggal Jadwal + Tombol Simpan Jadwal (+ Hapus khusus mobile) -->
+	<!-- Baris Atas: Tanggal Jadwal + Status Sinkronisasi Otomatis (+ Hapus khusus mobile) -->
 	<div class="flex flex-wrap items-center justify-between gap-2">
 		<div class="min-w-0 flex-1">
 			<h1 class="truncate font-display text-sm font-bold text-ink sm:text-base">
@@ -33,11 +31,6 @@
 			</h1>
 			<p class="text-[11px] font-semibold text-slate-500 sm:text-xs">
 				{completedCount} dari {totalCount} udah beres
-				{#if hasUnsavedChanges}
-					· Belum disimpen
-				{:else if lastSavedLabel}
-					· {lastSavedLabel}
-				{/if}
 			</p>
 		</div>
 
@@ -50,16 +43,55 @@
 				Hapus
 			</button>
 
-			<button
-				type="button"
-				onclick={onSaveSchedule}
-				disabled={isSaving}
-				class="neo-btn-sm inline-flex h-8 cursor-pointer items-center justify-center rounded-lg px-3 font-display text-xs font-bold transition-colors sm:h-9 sm:px-3.5 sm:text-sm {hasUnsavedChanges
-					? 'bg-mintpop text-ink hover:bg-green-300'
-					: 'bg-navy text-white hover:bg-navy-light'}"
-			>
-				{isSaving ? 'Lagi nyimpen...' : 'Simpen Jadwal'}
-			</button>
+			{#if syncStatus === 'saving'}
+				<span
+					role="status"
+					aria-live="polite"
+					class="neo-border inline-flex h-8 items-center gap-1.5 rounded-lg bg-butter px-2.5 font-display text-[11px] font-bold text-ink sm:h-9 sm:px-3 sm:text-xs"
+				>
+					<span class="h-2 w-2 animate-pulse rounded-full bg-ink" aria-hidden="true"></span>
+					<span>Lagi nyimpen...</span>
+				</span>
+			{:else if syncStatus === 'error'}
+				<button
+					type="button"
+					onclick={onRetrySync}
+					class="neo-btn-sm inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg bg-butter px-2.5 font-display text-xs font-bold text-ink hover:bg-yellow-300 sm:h-9 sm:px-3 sm:text-xs"
+				>
+					<svg
+						class="h-3.5 w-3.5 stroke-[2.6]"
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"
+					>
+						<polyline points="23 4 23 10 17 10" />
+						<path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+					</svg>
+					<span>Simpen Ulang</span>
+				</button>
+			{:else if syncStatus === 'saved'}
+				<span
+					role="status"
+					aria-live="polite"
+					class="neo-border inline-flex h-8 items-center gap-1 rounded-lg bg-mintpop px-2.5 font-display text-[11px] font-bold text-ink sm:h-9 sm:px-3 sm:text-xs"
+				>
+					<svg
+						class="h-3.5 w-3.5 stroke-[3]"
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"
+					>
+						<polyline points="20 6 9 17 4 12" />
+					</svg>
+					<span>Tersimpen</span>
+				</span>
+			{/if}
 		</div>
 	</div>
 

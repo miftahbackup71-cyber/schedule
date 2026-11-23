@@ -93,7 +93,7 @@
 					<div class="neo-border rounded-xl bg-white p-4 text-center">
 						<p class="font-display text-xs font-bold text-ink">Belum ada jadwal yang disimpen</p>
 						<p class="mt-1 text-[11px] font-medium text-slate-500">
-							Isi aktivitas dulu terus klik Simpen Jadwal biar muncul di sini.
+							Bikin aktivitas dulu, nanti jadwalmu otomatis kesimpen di sini.
 						</p>
 					</div>
 				{:else}
