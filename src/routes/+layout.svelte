@@ -7,7 +7,14 @@
 </script>
 
 <svelte:head>
+	<title>Kudil Schedule</title>
+	<meta
+		name="description"
+		content="Buat bikin schedule kalau main."
+	/>
 	<link rel="icon" href={favicon} />
 </svelte:head>
 
-{@render children()}
+<div class="flex min-h-screen flex-col">
+	{@render children()}
+</div>
