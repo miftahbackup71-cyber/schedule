@@ -32,6 +32,8 @@
 		const handleVisibilityChange = () => {
 			if (document.visibilityState === 'hidden' && store.hasPendingSync()) {
 				void store.flushPendingSync();
+			} else if (document.visibilityState === 'visible' && !isFormModalOpen) {
+				void store.refreshActiveFromServer();
 			}
 		};
 

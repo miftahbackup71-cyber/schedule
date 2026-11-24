@@ -1,9 +1,5 @@
 import { browser } from '$app/env';
-import {
-	getSupabaseClient,
-	resetSupabaseSession,
-	resolveSupabaseSession
-} from '#lib/supabase/client.ts';
+import { getSupabaseClient } from '#lib/supabase/client.ts';
 import type {
 	SavedScheduleSummary,
 	ScheduleFormInput,
@@ -18,7 +14,6 @@ const SAVED_STORAGE_KEY = 'kudil_saved_schedules_v3';
 
 interface ScheduleRow {
 	id: string;
-	user_id: string | null;
 	title: string;
 	start_time: string;
 	description: string | null;
@@ -88,8 +83,6 @@ export class ScheduleStore {
 	toasts = $state<ToastItem[]>([]);
 	lastAddedId = $state<string | null>(null);
 
-	private userId: string | null = null;
-	private authDisabled = false;
 	private pendingDeletes = new Map<string, PendingDelete>();
 	private toastTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -142,31 +135,12 @@ export class ScheduleStore {
 
 	async refreshSavedList(): Promise<void> {
 		if (!browser) return;
-		const localMap = this.readAllSavedLocal();
-		const summaryMap = new Map<string, SavedScheduleSummary>();
-
-		for (const [date, list] of Object.entries(localMap)) {
-			if (list.length > 0) {
-				summaryMap.set(date, {
-					date,
-					totalCount: list.length,
-					completedCount: list.filter((i) => i.is_completed).length
-				});
-			}
-		}
 
 		try {
-			const session = await resolveSupabaseSession();
-			this.userId = session.userId;
-			this.authDisabled = session.authDisabled;
-
 			const supabase = getSupabaseClient();
-			let query = supabase.from('schedules').select('schedule_date, is_completed');
-			if (this.userId) {
-				query = query.eq('user_id', this.userId);
-			}
-
-			const { data, error } = await query;
+			const { data, error } = await supabase
+				.from('schedules')
+				.select('schedule_date, is_completed');
 			if (error) throw error;
 
 			const remoteCounts = new Map<string, { total: number; done: number }>();
@@ -177,6 +151,7 @@ export class ScheduleStore {
 				remoteCounts.set(row.schedule_date, prev);
 			}
 
+			const summaryMap = new Map<string, SavedScheduleSummary>();
 			for (const [date, counts] of remoteCounts.entries()) {
 				summaryMap.set(date, {
 					date,
@@ -184,13 +159,40 @@ export class ScheduleStore {
 					completedCount: counts.done
 				});
 			}
+
+			// Pertahankan tanggal yang sedang antre / gagal sync di perangkat agar tidak hilang dari daftar
+			const unsyncedDate =
+				this.pendingSnapshot?.date ??
+				(this.syncStatus === 'error' ? this.selectedDate : null);
+			if (unsyncedDate && this.items.length > 0 && unsyncedDate === this.selectedDate) {
+				summaryMap.set(unsyncedDate, {
+					date: unsyncedDate,
+					totalCount: this.items.length,
+					completedCount: this.items.filter((i) => i.is_completed).length
+				});
+			}
+
+			// Bersihkan cache localStorage untuk tanggal yang sudah dihapus dari perangkat lain
+			this.pruneLocalCache(new Set(summaryMap.keys()));
+
+			this.savedSchedules = Array.from(summaryMap.values()).sort((a, b) =>
+				b.date.localeCompare(a.date)
+			);
 		} catch (err) {
 			console.warn('Gagal memuat daftar jadwal dari server, memakai daftar di perangkat:', err);
+			const localMap = this.readAllSavedLocal();
+			const fallback: SavedScheduleSummary[] = [];
+			for (const [date, list] of Object.entries(localMap)) {
+				if (list.length > 0) {
+					fallback.push({
+						date,
+						totalCount: list.length,
+						completedCount: list.filter((i) => i.is_completed).length
+					});
+				}
+			}
+			this.savedSchedules = fallback.sort((a, b) => b.date.localeCompare(a.date));
 		}
-
-		this.savedSchedules = Array.from(summaryMap.values()).sort((a, b) =>
-			b.date.localeCompare(a.date)
-		);
 	}
 
 	async openSavedSchedule(isoDate: string, showFeedback = true): Promise<void> {
@@ -202,52 +204,28 @@ export class ScheduleStore {
 		this.selectedDate = isoDate;
 
 		try {
-			const session = await resolveSupabaseSession();
-			this.userId = session.userId;
-			this.authDisabled = session.authDisabled;
-
 			const supabase = getSupabaseClient();
-			let query = supabase
+			const { data, error } = await supabase
 				.from('schedules')
 				.select(
-					'id, user_id, title, start_time, description, helper_text, position, is_completed, schedule_date'
+					'id, title, start_time, description, helper_text, position, is_completed, schedule_date'
 				)
 				.eq('schedule_date', isoDate)
 				.order('position', { ascending: true });
 
-			if (this.userId) {
-				query = query.eq('user_id', this.userId);
-			}
-
-			const { data, error } = await query;
 			if (error) throw error;
 
-			const remoteItems: ScheduleItem[] = ((data ?? []) as ScheduleRow[]).map((row) => ({
-				id: row.id,
-				title: row.title,
-				start_time: normalizeTime(row.start_time),
-				description: row.description ?? '',
-				helper_text: row.helper_text ?? '',
-				position: row.position,
-				is_completed: row.is_completed,
-				schedule_date: row.schedule_date
-			}));
+			const remoteItems = this.mapRows(data as ScheduleRow[] | null);
 
-			if (remoteItems.length > 0) {
-				this.items = remoteItems;
-				this.writeSavedLocalForDate(isoDate, remoteItems);
-				this.updateSavedSummaryForDate(isoDate, remoteItems);
-				this.syncStatus = 'saved';
-				this.connectionNotice = null;
-			} else {
-				const localItems = this.readSavedLocalForDate(isoDate);
-				this.items = localItems;
-				if (localItems.length > 0) {
-					// Data sebelumnya baru tersimpan di perangkat — langsung unggah ke Supabase
-					this.persistAndSync(0);
-				} else {
-					this.syncStatus = 'idle';
-				}
+			// Server adalah source of truth saat online
+			this.items = remoteItems;
+			this.writeSavedLocalForDate(isoDate, remoteItems);
+			this.updateSavedSummaryForDate(isoDate, remoteItems);
+			this.syncStatus = remoteItems.length > 0 ? 'saved' : 'idle';
+			this.connectionNotice = null;
+
+			if (remoteItems.length === 0) {
+				this.selectedDate = null;
 			}
 
 			if (showFeedback) {
@@ -262,6 +240,55 @@ export class ScheduleStore {
 			}
 		} finally {
 			this.isLoading = false;
+		}
+	}
+
+	/**
+	 * Menarik pembaruan terbaru dari Supabase secara diam-diam (tanpa skeleton)
+	 * saat pengguna kembali membuka tab/aplikasi dari perangkat lain.
+	 */
+	async refreshActiveFromServer(): Promise<void> {
+		if (!browser || this.isLoading || this.hasPendingSync()) return;
+
+		await this.refreshSavedList();
+		if (this.hasPendingSync()) return;
+
+		const targetDate = this.selectedDate;
+		if (!targetDate) {
+			const today = getTodayIsoDate();
+			if (this.savedSchedules.some((s) => s.date === today)) {
+				await this.openSavedSchedule(today, false);
+			}
+			return;
+		}
+
+		try {
+			const supabase = getSupabaseClient();
+			const { data, error } = await supabase
+				.from('schedules')
+				.select(
+					'id, title, start_time, description, helper_text, position, is_completed, schedule_date'
+				)
+				.eq('schedule_date', targetDate)
+				.order('position', { ascending: true });
+
+			if (error) throw error;
+			if (this.hasPendingSync() || this.selectedDate !== targetDate) return;
+
+			const remoteItems = this.mapRows(data as ScheduleRow[] | null);
+			this.items = remoteItems;
+			this.writeSavedLocalForDate(targetDate, remoteItems);
+			this.updateSavedSummaryForDate(targetDate, remoteItems);
+			this.connectionNotice = null;
+
+			if (remoteItems.length > 0) {
+				this.syncStatus = 'saved';
+			} else {
+				this.selectedDate = null;
+				this.syncStatus = 'idle';
+			}
+		} catch (err) {
+			console.warn('Gagal menyegarkan jadwal dari server:', err);
 		}
 	}
 
@@ -459,14 +486,11 @@ export class ScheduleStore {
 			this.writeSavedLocalForDate(date, []);
 			this.updateSavedSummaryForDate(date, []);
 			try {
-				const session = await resolveSupabaseSession();
-				this.userId = session.userId;
 				const supabase = getSupabaseClient();
-				let clearQuery = supabase.from('schedules').delete().eq('schedule_date', date);
-				if (this.userId) {
-					clearQuery = clearQuery.eq('user_id', this.userId);
-				}
-				const { error } = await clearQuery;
+				const { error } = await supabase
+					.from('schedules')
+					.delete()
+					.eq('schedule_date', date);
 				if (error) throw error;
 			} catch (err) {
 				console.error('[KudilSchedule] Gagal menghapus jadwal di Supabase:', err);
@@ -501,6 +525,19 @@ export class ScheduleStore {
 			this.toastTimers.delete(id);
 		}
 		this.toasts = this.toasts.filter((t) => t.id !== id);
+	}
+
+	private mapRows(rows: ScheduleRow[] | null): ScheduleItem[] {
+		return (rows ?? []).map((row) => ({
+			id: row.id,
+			title: row.title,
+			start_time: normalizeTime(row.start_time),
+			description: row.description ?? '',
+			helper_text: row.helper_text ?? '',
+			position: row.position,
+			is_completed: row.is_completed,
+			schedule_date: row.schedule_date
+		}));
 	}
 
 	private persistAndSync(debounceMs: number): void {
@@ -582,31 +619,21 @@ export class ScheduleStore {
 		return this.activeSyncPromise;
 	}
 
-	private async syncSnapshotToSupabase(
-		snapshot: SyncSnapshot,
-		allowSessionReset = true
-	): Promise<boolean> {
+	private async syncSnapshotToSupabase(snapshot: SyncSnapshot): Promise<boolean> {
 		try {
-			const session = await resolveSupabaseSession();
-			this.userId = session.userId;
-			this.authDisabled = session.authDisabled;
-
 			const supabase = getSupabaseClient();
 
 			if (snapshot.items.length > 0) {
-				const rows = snapshot.items.map((item) => {
-					const base = {
-						id: item.id,
-						title: item.title,
-						start_time: item.start_time,
-						description: item.description,
-						helper_text: item.helper_text,
-						position: item.position,
-						is_completed: item.is_completed,
-						schedule_date: snapshot.date
-					};
-					return this.userId ? { ...base, user_id: this.userId } : base;
-				});
+				const rows = snapshot.items.map((item) => ({
+					id: item.id,
+					title: item.title,
+					start_time: item.start_time,
+					description: item.description,
+					helper_text: item.helper_text,
+					position: item.position,
+					is_completed: item.is_completed,
+					schedule_date: snapshot.date
+				}));
 
 				const { error: upsertError } = await supabase
 					.from('schedules')
@@ -614,15 +641,10 @@ export class ScheduleStore {
 
 				if (upsertError) throw upsertError;
 
-				let existingQuery = supabase
+				const { data: existingRows, error: selectError } = await supabase
 					.from('schedules')
 					.select('id')
 					.eq('schedule_date', snapshot.date);
-				if (this.userId) {
-					existingQuery = existingQuery.eq('user_id', this.userId);
-				}
-
-				const { data: existingRows, error: selectError } = await existingQuery;
 				if (selectError) throw selectError;
 
 				const currentIds = new Set(snapshot.items.map((i) => i.id));
@@ -631,57 +653,43 @@ export class ScheduleStore {
 					.filter((id) => !currentIds.has(id));
 
 				if (staleIds.length > 0) {
-					let delQuery = supabase.from('schedules').delete().in('id', staleIds);
-					if (this.userId) {
-						delQuery = delQuery.eq('user_id', this.userId);
-					}
-					const { error: delError } = await delQuery;
+					const { error: delError } = await supabase
+						.from('schedules')
+						.delete()
+						.in('id', staleIds);
 					if (delError) throw delError;
 				}
 			} else {
-				let clearQuery = supabase.from('schedules').delete().eq('schedule_date', snapshot.date);
-				if (this.userId) {
-					clearQuery = clearQuery.eq('user_id', this.userId);
-				}
-				const { error: clearError } = await clearQuery;
+				const { error: clearError } = await supabase
+					.from('schedules')
+					.delete()
+					.eq('schedule_date', snapshot.date);
 				if (clearError) throw clearError;
 			}
 
 			return true;
 		} catch (err) {
 			const pgCode = (err as { code?: string } | null)?.code;
-			const status = (err as { status?: number } | null)?.status;
 			const msg = (err as { message?: string } | null)?.message ?? '';
-
-			// Recovery otomatis jika sesi anonim lokal sudah tidak valid / user dihapus di server
-			if (
-				allowSessionReset &&
-				(pgCode === '23503' || status === 401 || msg.toLowerCase().includes('jwt'))
-			) {
-				try {
-					const fresh = await resetSupabaseSession();
-					this.userId = fresh.userId;
-					this.authDisabled = fresh.authDisabled;
-					return this.syncSnapshotToSupabase(snapshot, false);
-				} catch (resetErr) {
-					console.error('[KudilSchedule] Gagal memperbarui sesi anonim Supabase:', resetErr);
-				}
-			}
 
 			console.error('[KudilSchedule] Gagal sinkron ke Supabase:', err);
 
 			const hadNoticeBefore = this.connectionNotice !== null;
 			if (pgCode === '42501' || msg.toLowerCase().includes('row-level security')) {
-				this.connectionNotice = this.authDisabled
-					? 'Aktifkan "Allow anonymous sign-ins" di Dashboard Supabase (Authentication -> Providers) agar jadwal bisa disimpen ke server.'
-					: 'Izin simpen ditolak oleh aturan RLS Supabase. Cek policy tabel schedules.';
+				this.connectionNotice =
+					'Izin akses ditolak aturan RLS Supabase. Jalankan ulang SQL policy shared di supabase/schema.sql lewat SQL Editor Supabase ya.';
 			} else {
 				this.connectionNotice =
 					'Belum bisa nyimpen ke server. Perubahan tetap aman di perangkat ini — klik Simpen Ulang nanti ya.';
 			}
 
 			if (!hadNoticeBefore) {
-				this.showToast('Gagal sinkron ke server, sementara disimpen di perangkat ya.', 'butter', undefined, 3600);
+				this.showToast(
+					'Gagal sinkron ke server, sementara disimpen di perangkat ya.',
+					'butter',
+					undefined,
+					3600
+				);
 			}
 
 			return false;
@@ -698,6 +706,25 @@ export class ScheduleStore {
 			});
 		}
 		this.savedSchedules = filtered.sort((a, b) => b.date.localeCompare(a.date));
+	}
+
+	private pruneLocalCache(validDates: Set<string>): void {
+		if (!browser) return;
+		try {
+			const map = this.readAllSavedLocal();
+			let changed = false;
+			for (const date of Object.keys(map)) {
+				if (!validDates.has(date)) {
+					delete map[date];
+					changed = true;
+				}
+			}
+			if (changed) {
+				localStorage.setItem(SAVED_STORAGE_KEY, JSON.stringify(map));
+			}
+		} catch {
+			// Abaikan jika penyimpanan browser tidak tersedia
+		}
 	}
 
 	private readAllSavedLocal(): Record<string, ScheduleItem[]> {

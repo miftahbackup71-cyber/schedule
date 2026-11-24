@@ -12,8 +12,8 @@ create table if not exists public.schedules (
   updated_at timestamptz not null default now()
 );
 
-create index if not exists idx_schedules_user_date_pos
-  on public.schedules (user_id, schedule_date, position asc);
+create index if not exists idx_schedules_date_pos
+  on public.schedules (schedule_date, position asc);
 
 create or replace function public.set_updated_at()
 returns trigger as $$
@@ -32,8 +32,10 @@ create trigger trg_schedules_updated_at
 alter table public.schedules enable row level security;
 
 drop policy if exists "Users can manage their own schedules" on public.schedules;
-create policy "Users can manage their own schedules"
+drop policy if exists "Shared access for all schedules" on public.schedules;
+create policy "Shared access for all schedules"
   on public.schedules
   for all
-  using (auth.uid() = user_id)
-  with check (auth.uid() = user_id);
+  to anon, authenticated
+  using (true)
+  with check (true);
