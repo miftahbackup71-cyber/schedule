@@ -14,6 +14,7 @@
 	import ToastHost from '#lib/components/ToastHost.svelte';
 	import { ScheduleStore } from '#lib/stores/schedule.svelte.ts';
 	import type { ScheduleFormInput, ScheduleItem } from '#lib/types/schedule.ts';
+	import { copyTextToClipboard, formatScheduleForWhatsApp } from '#lib/utils/whatsapp.ts';
 
 	const store = new ScheduleStore();
 
@@ -22,6 +23,8 @@
 	let editingItem = $state<ScheduleItem | null>(null);
 	let isClearConfirmOpen = $state(false);
 	let isEasterEggOpen = $state(false);
+	let isCopiedWa = $state(false);
+	let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 
 	let hasFloatingMobileCta = $derived(!store.isLoading && store.totalCount > 0);
 	let requireDateInModal = $derived(!editingItem && store.totalCount === 0);
@@ -50,6 +53,9 @@
 		return () => {
 			document.removeEventListener('visibilitychange', handleVisibilityChange);
 			window.removeEventListener('beforeunload', handleBeforeUnload);
+			if (copyResetTimer) {
+				clearTimeout(copyResetTimer);
+			}
 		};
 	});
 
@@ -104,6 +110,25 @@
 		isClearConfirmOpen = false;
 		await store.clearCurrentSchedule();
 	}
+
+	async function handleCopyWhatsApp() {
+		if (!store.selectedDate || store.items.length === 0) return;
+
+		const formattedText = formatScheduleForWhatsApp(store.formattedSelectedDate, store.items);
+		const ok = await copyTextToClipboard(formattedText);
+
+		if (ok) {
+			isCopiedWa = true;
+			if (copyResetTimer) clearTimeout(copyResetTimer);
+			copyResetTimer = setTimeout(() => {
+				isCopiedWa = false;
+				copyResetTimer = null;
+			}, 2000);
+			store.showToast('Jadwal udah disalin, tinggal paste ke WA!', 'mint');
+		} else {
+			store.showToast('Gagal nyalin jadwal, coba lagi ya.', 'coral');
+		}
+	}
 </script>
 
 <BackgroundOrnament />
@@ -145,6 +170,8 @@
 				completedCount={store.completedCount}
 				progressPercent={store.progressPercent}
 				syncStatus={store.syncStatus}
+				isCopied={isCopiedWa}
+				onCopyWhatsApp={handleCopyWhatsApp}
 				onRetrySync={() => store.retrySync()}
 				onRequestClearAll={() => (isClearConfirmOpen = true)}
 			/>

@@ -7,6 +7,8 @@
 		completedCount: number;
 		progressPercent: number;
 		syncStatus: SyncStatus;
+		isCopied?: boolean;
+		onCopyWhatsApp: () => void;
 		onRetrySync: () => void;
 		onRequestClearAll: () => void;
 	}
@@ -17,13 +19,15 @@
 		completedCount,
 		progressPercent,
 		syncStatus,
+		isCopied = false,
+		onCopyWhatsApp,
 		onRetrySync,
 		onRequestClearAll
 	}: Props = $props();
 </script>
 
 <section class="neo-border neo-shadow rounded-xl bg-white p-3 sm:rounded-2xl sm:p-4">
-	<!-- Baris Atas: Tanggal Jadwal + Status Sinkronisasi Otomatis (+ Hapus khusus mobile) -->
+	<!-- Baris Atas: Tanggal Jadwal + Aksi Desktop & Status Sinkronisasi -->
 	<div class="flex flex-wrap items-center justify-between gap-2">
 		<div class="min-w-0 flex-1">
 			<h1 class="truncate font-display text-sm font-bold text-ink sm:text-base">
@@ -35,12 +39,42 @@
 		</div>
 
 		<div class="flex shrink-0 items-center gap-1.5">
+			<!-- Tombol Salin ke WA (Desktop: sejajar di baris atas) -->
 			<button
 				type="button"
-				onclick={onRequestClearAll}
-				class="neo-btn-sm inline-flex h-8 cursor-pointer items-center justify-center rounded-lg bg-coralpop px-2.5 font-display text-xs font-bold text-ink hover:bg-red-300 sm:hidden"
+				onclick={onCopyWhatsApp}
+				class="neo-btn-sm hidden h-9 cursor-pointer items-center gap-1.5 rounded-lg px-3 font-display text-xs font-bold text-ink transition-colors sm:inline-flex {isCopied
+					? 'bg-mintpop hover:bg-green-300'
+					: 'bg-skypop hover:bg-sky-300'}"
 			>
-				Hapus
+				{#if isCopied}
+					<svg
+						class="h-3.5 w-3.5 stroke-[3]"
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"
+					>
+						<polyline points="20 6 9 17 4 12" />
+					</svg>
+					<span>Udah Disalin</span>
+				{:else}
+					<svg
+						class="h-3.5 w-3.5 stroke-[2.4]"
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"
+					>
+						<rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+						<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+					</svg>
+					<span>Salin ke WA</span>
+				{/if}
 			</button>
 
 			{#if syncStatus === 'saving'}
@@ -108,5 +142,53 @@
 			class="h-full rounded-full bg-mintpop transition-all duration-300"
 			style:width="{progressPercent}%"
 		></div>
+	</div>
+
+	<!-- Baris Aksi Khusus Mobile: Salin ke WA + Hapus -->
+	<div class="mt-2.5 flex items-center gap-2 sm:hidden">
+		<button
+			type="button"
+			onclick={onCopyWhatsApp}
+			class="neo-btn-sm inline-flex h-9 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-lg px-3 font-display text-xs font-bold text-ink transition-colors {isCopied
+				? 'bg-mintpop hover:bg-green-300'
+				: 'bg-skypop hover:bg-sky-300'}"
+		>
+			{#if isCopied}
+				<svg
+					class="h-3.5 w-3.5 stroke-[3]"
+					viewBox="0 0 24 24"
+					fill="none"
+					stroke="currentColor"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					aria-hidden="true"
+				>
+					<polyline points="20 6 9 17 4 12" />
+				</svg>
+				<span>Udah Disalin</span>
+			{:else}
+				<svg
+					class="h-3.5 w-3.5 stroke-[2.4]"
+					viewBox="0 0 24 24"
+					fill="none"
+					stroke="currentColor"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					aria-hidden="true"
+				>
+					<rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+					<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+				</svg>
+				<span>Salin ke WA</span>
+			{/if}
+		</button>
+
+		<button
+			type="button"
+			onclick={onRequestClearAll}
+			class="neo-btn-sm inline-flex h-9 shrink-0 cursor-pointer items-center justify-center rounded-lg bg-coralpop px-3 font-display text-xs font-bold text-ink hover:bg-red-300"
+		>
+			Hapus
+		</button>
 	</div>
 </section>
